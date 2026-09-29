@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 base64 = "0.22"
+bitflags = "2"
 jpeg-encoder = "0.6"
 libc = "0.2"
 memmap2 = "0.9"

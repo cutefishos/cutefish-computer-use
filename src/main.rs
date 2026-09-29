@@ -1,19 +1,23 @@
 // An MCP server over stdio that lets an agent see the Cutefish desktop and use
 // its pointer and keyboard, once the user allows it.
 
+mod apps;
 mod desktop;
 mod image;
 mod keys;
 mod protocol;
+mod session;
 
+use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
+use std::path::Path;
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use serde_json::{json, Value};
 
-use desktop::Desktop;
+use desktop::{Desktop, Window};
 use keys::{Key, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, KEY_LEFTALT, KEY_LEFTCTRL, KEY_LEFTMETA, KEY_LEFTSHIFT};
 
 const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
@@ -23,9 +27,17 @@ const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 // connection, and a commit overtakes keys still queued.
 const TEXT_BURST: usize = 32;
 const TEXT_PAUSE: Duration = Duration::from_millis(100);
+// A restored window or a desk switch animates for about this long.
+const WINDOW_SETTLE: Duration = Duration::from_millis(400);
+// How long a started application gets to show a window before the tool returns.
+const LAUNCH_TIMEOUT: Duration = Duration::from_secs(5);
+const LAUNCH_POLL: Duration = Duration::from_millis(250);
+const MAX_HOLD_SECONDS: f64 = 10.0;
 
 const INSTRUCTIONS: &str = "Controls the Cutefish desktop the user is sitting at. \
 Take a screenshot first: every x and y is a pixel of the latest screenshot. \
+Use zoom to read small text. Prefer open_application, open and \
+activate_window over clicking through the desktop to reach an application. \
 The first action asks the user for permission. \
 Input pauses while the user uses the pointer or keyboard, and system dialogs \
 (permission and password prompts) are only for the user to answer.";
@@ -39,6 +51,20 @@ fn tools() -> Value {
             "name": "screenshot",
             "description": "Captures the whole desktop, every display, as one image. Coordinates of the other tools are pixels of the latest screenshot.",
             "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "zoom",
+            "description": "Shows a region of the latest screenshot at up to the display's full resolution, to read small text. Coordinates of the other tools still refer to the whole screenshot.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "x": point("Left edge, a screenshot pixel column."),
+                    "y": point("Top edge, a screenshot pixel row."),
+                    "width": point("In screenshot pixels."),
+                    "height": point("In screenshot pixels.")
+                },
+                "required": ["x", "y", "width", "height"]
+            }
         },
         {
             "name": "click",
@@ -84,6 +110,35 @@ fn tools() -> Value {
             }
         },
         {
+            "name": "mouse_down",
+            "description": "Presses a mouse button and keeps it pressed, at a point if one is given; mouse_up releases it. For drags that drag cannot do. The user's own input releases it too.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "x": point("Screenshot pixel column."),
+                    "y": point("Screenshot pixel row."),
+                    "button": { "type": "string", "enum": ["left", "right", "middle"], "default": "left" }
+                }
+            }
+        },
+        {
+            "name": "mouse_up",
+            "description": "Releases a mouse button mouse_down pressed, at a point if one is given.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "x": point("Screenshot pixel column."),
+                    "y": point("Screenshot pixel row."),
+                    "button": { "type": "string", "enum": ["left", "right", "middle"], "default": "left" }
+                }
+            }
+        },
+        {
+            "name": "cursor_position",
+            "description": "Tells where the pointer is, in pixels of the latest screenshot.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
             "name": "scroll",
             "description": "Scrolls by wheel clicks, at a point if one is given.",
             "inputSchema": {
@@ -115,6 +170,55 @@ fn tools() -> Value {
                     "repeat": { "type": "integer", "minimum": 1, "maximum": 50, "default": 1 }
                 },
                 "required": ["keys"]
+            }
+        },
+        {
+            "name": "hold_keys",
+            "description": "Holds a key or shortcut down for a while, then releases it, e.g. to repeat an arrow key. Keys are named as for press_keys.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "keys": { "type": "string" },
+                    "seconds": { "type": "number", "minimum": 0, "maximum": MAX_HOLD_SECONDS }
+                },
+                "required": ["keys", "seconds"]
+            }
+        },
+        {
+            "name": "list_windows",
+            "description": "Lists the application windows on every desk, most recently used first, with their numbers for activate_window and their frames in screenshot pixels.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "activate_window",
+            "description": "Brings a window forward and gives it the keyboard focus, restoring it if it is minimized and switching to its desk.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "window": { "type": "integer", "description": "The number list_windows gave it." } },
+                "required": ["window"]
+            }
+        },
+        {
+            "name": "list_applications",
+            "description": "Lists the installed applications, by name and id.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "open_application",
+            "description": "Starts an installed application and waits a few seconds for its window.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "name": { "type": "string", "description": "Its name or id, as list_applications gives them." } },
+                "required": ["name"]
+            }
+        },
+        {
+            "name": "open",
+            "description": "Opens a file, folder or URL in the application that handles it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "target": { "type": "string", "description": "An absolute path, a path starting with ~/, or a URL." } },
+                "required": ["target"]
             }
         },
         {
@@ -214,6 +318,86 @@ fn segments(text: &str) -> Vec<&str> {
     parts
 }
 
+// A point, when both x and y are given.
+fn optional_point(desktop: &mut Desktop, arguments: &Value) -> Result<Option<(f64, f64)>, String> {
+    match (arguments.get("x"), arguments.get("y")) {
+        (Some(_), Some(_)) => {
+            Ok(Some(desktop.to_logical(number(arguments, "x")?, number(arguments, "y")?)?))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn string<'a>(arguments: &'a Value, name: &str) -> Result<&'a str, String> {
+    arguments.get(name).and_then(Value::as_str).ok_or_else(|| format!("\"{name}\" must be a string."))
+}
+
+fn describe_window(window: &Window, apps: &[apps::App], layout: &image::Layout) -> String {
+    let mut line = format!("{}. \"{}\"", window.handle, window.title);
+    match apps::for_window(apps, &window.app_id) {
+        Some(app) => line += &format!(", {} ({})", app.display_name(), app.id),
+        None if !window.app_id.is_empty() => line += &format!(", {}", window.app_id),
+        None => {}
+    }
+    let mut states = Vec::new();
+    if window.active {
+        states.push("active");
+    }
+    if window.minimized {
+        states.push("minimized");
+    }
+    if window.hidden {
+        states.push("hidden");
+    }
+    if window.other_desk {
+        states.push("on another desk");
+    }
+    for state in &states {
+        line += &format!(", {state}");
+    }
+    if !window.minimized && !window.hidden && !window.other_desk {
+        let rect = window.rect;
+        let (left, top) = layout.to_image_point(rect.x as f64, rect.y as f64);
+        let (right, bottom) =
+            layout.to_image_point((rect.x + rect.width) as f64, (rect.y + rect.height) as f64);
+        line += &format!(
+            ", at {},{} size {}x{}",
+            left.round(),
+            top.round(),
+            (right - left).round(),
+            (bottom - top).round()
+        );
+    }
+    line
+}
+
+// A file target as an absolute path, or a URL as it is.
+fn open_target(target: &str) -> Result<String, String> {
+    let target = target.trim();
+    if let Some((scheme, _)) = target.split_once(':') {
+        let is_scheme = scheme.len() > 1
+            && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+            && scheme.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+        if is_scheme {
+            return Ok(target.to_string());
+        }
+    }
+    let path = match target.strip_prefix("~/") {
+        Some(rest) => {
+            let home = session::variable("HOME").ok_or("The home folder is unknown.")?;
+            Path::new(&home).join(rest)
+        }
+        None => Path::new(target).to_path_buf(),
+    };
+    if !path.is_absolute() {
+        return Err("Give an absolute path, one starting with ~/, or a URL.".into());
+    }
+    if !path.exists() {
+        return Err(format!("{} does not exist.", path.display()));
+    }
+    Ok(path.to_string_lossy().into_owned())
+}
+
 fn untypable(typed: bool) -> String {
     if typed {
         format!("{} The text before that was typed.", desktop::UNTYPABLE)
@@ -234,6 +418,30 @@ impl Server {
         Ok(desktop)
     }
 
+    // Waits for a window that is not among `before`, and says what came up.
+    fn new_window(&mut self, before: &HashSet<u32>) -> Result<String, String> {
+        let deadline = Instant::now() + LAUNCH_TIMEOUT;
+        let desktop = self.desktop()?;
+        loop {
+            sleep(LAUNCH_POLL);
+            let windows = desktop.windows()?;
+            if let Some(window) = windows.iter().find(|w| !before.contains(&w.handle)) {
+                let layout = desktop.layout()?;
+                return Ok(format!(
+                    "Its window: {}.",
+                    describe_window(window, &apps::named(), &layout)
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Ok("No new window has shown yet; take a screenshot.".into());
+            }
+        }
+    }
+
+    fn handles(&mut self) -> Result<HashSet<u32>, String> {
+        Ok(self.desktop()?.windows()?.iter().map(|w| w.handle).collect())
+    }
+
     fn call(&mut self, name: &str, arguments: &Value) -> Result<Value, String> {
         match name {
             "screenshot" => {
@@ -247,6 +455,31 @@ impl Server {
                     {
                         "type": "text",
                         "text": format!("The desktop at {}x{} pixels.", layout.width, layout.height)
+                    }
+                ] }))
+            }
+            "zoom" => {
+                let (x, y) = (number(arguments, "x")?, number(arguments, "y")?);
+                let (width, height) = (number(arguments, "width")?, number(arguments, "height")?);
+                if width < 1.0 || height < 1.0 {
+                    return Err("\"width\" and \"height\" must be at least 1.".into());
+                }
+                let (data, mime_type, layout) = self.desktop()?.zoom(x, y, width, height)?;
+                Ok(json!({ "content": [
+                    {
+                        "type": "image",
+                        "data": base64::engine::general_purpose::STANDARD.encode(data),
+                        "mimeType": mime_type
+                    },
+                    {
+                        "type": "text",
+                        "text": format!(
+                            "Screenshot pixels {x},{y} to {},{} at {}x{} pixels. Coordinates still refer to the whole screenshot.",
+                            x + width,
+                            y + height,
+                            layout.width,
+                            layout.height
+                        )
                     }
                 ] }))
             }
@@ -304,6 +537,26 @@ impl Server {
                 })?;
                 Ok(text("Dragged."))
             }
+            "mouse_down" | "mouse_up" => {
+                let button = button(arguments)?;
+                let pressed = name == "mouse_down";
+                let desktop = self.desktop()?;
+                let point = optional_point(desktop, arguments)?;
+                desktop.inject(&|batch| {
+                    if let Some(point) = point {
+                        batch.motion(point);
+                        batch.pause(20);
+                    }
+                    batch.button(button, pressed);
+                })?;
+                Ok(text(if pressed { "Pressed." } else { "Released." }))
+            }
+            "cursor_position" => {
+                let desktop = self.desktop()?;
+                let (x, y) = desktop.pointer()?;
+                let (x, y) = desktop.layout()?.to_image_point(x, y);
+                Ok(text(format!("The pointer is at {},{}.", x.floor(), y.floor())))
+            }
             "scroll" => {
                 let vertical = optional_integer(arguments, "vertical", 0)?.clamp(-100, 100) as i32;
                 let horizontal = optional_integer(arguments, "horizontal", 0)?.clamp(-100, 100) as i32;
@@ -311,10 +564,7 @@ impl Server {
                     return Err("Give \"vertical\" or \"horizontal\" clicks.".into());
                 }
                 let desktop = self.desktop()?;
-                let point = match (arguments.get("x"), arguments.get("y")) {
-                    (Some(_), Some(_)) => Some(desktop.to_logical(number(arguments, "x")?, number(arguments, "y")?)?),
-                    _ => None,
-                };
+                let point = optional_point(desktop, arguments)?;
                 desktop.inject(&|batch| {
                     if let Some(point) = point {
                         batch.motion(point);
@@ -380,6 +630,63 @@ impl Server {
                     })?;
                 }
                 Ok(text("Pressed."))
+            }
+            "hold_keys" => {
+                let keys = keys::parse_chord(string(arguments, "keys")?)?;
+                let seconds = number(arguments, "seconds")?.clamp(0.0, MAX_HOLD_SECONDS);
+                self.desktop()?.inject(&|batch| {
+                    for &key in &keys {
+                        batch.key(key, true);
+                    }
+                    batch.pause((seconds * 1000.0) as u64);
+                    for &key in keys.iter().rev() {
+                        batch.key(key, false);
+                    }
+                })?;
+                Ok(text("Held."))
+            }
+            "list_windows" => {
+                let desktop = self.desktop()?;
+                let windows = desktop.windows()?;
+                if windows.is_empty() {
+                    return Ok(text("No application windows are open."));
+                }
+                let layout = desktop.layout()?;
+                let apps = apps::named();
+                let lines: Vec<String> =
+                    windows.iter().map(|w| describe_window(w, &apps, &layout)).collect();
+                Ok(text(lines.join("\n")))
+            }
+            "activate_window" => {
+                let handle = arguments
+                    .get("window")
+                    .and_then(Value::as_u64)
+                    .and_then(|handle| u32::try_from(handle).ok())
+                    .ok_or("\"window\" must be a number from list_windows.")?;
+                self.desktop()?.inject(&|batch| batch.activate_window(handle))?;
+                sleep(WINDOW_SETTLE);
+                Ok(text("Activated."))
+            }
+            "list_applications" => {
+                let lines: Vec<String> = apps::installed()
+                    .iter()
+                    .map(|app| format!("{} ({})", app.display_name(), app.id))
+                    .collect();
+                Ok(text(lines.join("\n")))
+            }
+            "open_application" => {
+                let app = apps::find(&apps::installed(), string(arguments, "name")?)?;
+                let before = self.handles()?;
+                session::launch_application(&app.id)?;
+                let window = self.new_window(&before)?;
+                Ok(text(format!("Started {}. {window}", app.display_name())))
+            }
+            "open" => {
+                let target = open_target(string(arguments, "target")?)?;
+                let before = self.handles()?;
+                session::open(&target)?;
+                let window = self.new_window(&before)?;
+                Ok(text(format!("Opened {target}. {window}")))
             }
             "wait" => {
                 let seconds = number(arguments, "seconds")?.clamp(0.0, 30.0);
@@ -481,6 +788,17 @@ mod tests {
         assert!(pieces.iter().all(|p| p.chars().count() <= TEXT_BURST && !p.ends_with('\r')));
         assert!(pieces[1].starts_with('\r'));
         assert_eq!(pieces.len(), 3);
+    }
+
+    #[test]
+    fn open_targets_are_urls_or_existing_absolute_paths() {
+        assert_eq!(open_target(" https://example.com/a:b ").unwrap(), "https://example.com/a:b");
+        assert_eq!(open_target("mailto:someone@example.com").unwrap(), "mailto:someone@example.com");
+        assert_eq!(open_target("/").unwrap(), "/");
+        assert!(open_target("-x:y").is_err());
+        assert!(open_target("--help").is_err());
+        assert!(open_target("relative/path").is_err());
+        assert!(open_target("/nonexistent/file").is_err());
     }
 
     #[test]

@@ -1,5 +1,5 @@
-// The desktop as one image: every output scaled into the logical layout, then
-// down to a size a model reads whole.
+// The desktop, or a part of it, as one image: every output scaled into the
+// logical layout, then down to a size a model reads whole.
 
 // Anthropic's guidance for screenshots: the long edge and the pixel count a
 // model sees without scaling the image itself.
@@ -17,6 +17,21 @@ pub struct Rect {
     pub height: i32,
 }
 
+impl Rect {
+    pub fn intersection(&self, other: &Rect) -> Option<Rect> {
+        let left = self.x.max(other.x);
+        let top = self.y.max(other.y);
+        let right = (self.x + self.width).min(other.x + other.width);
+        let bottom = (self.y + self.height).min(other.y + other.height);
+        (right > left && bottom > top).then(|| Rect {
+            x: left,
+            y: top,
+            width: right - left,
+            height: bottom - top,
+        })
+    }
+}
+
 // Maps screenshot pixels to the compositor's global logical coordinates.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Layout {
@@ -27,21 +42,26 @@ pub struct Layout {
 }
 
 impl Layout {
+    // The whole desktop at no more than its logical size.
     pub fn of(outputs: &[Rect]) -> Option<Layout> {
         let usable: Vec<&Rect> = outputs.iter().filter(|r| r.width > 0 && r.height > 0).collect();
         let left = usable.iter().map(|r| r.x).min()?;
         let top = usable.iter().map(|r| r.y).min()?;
         let right = usable.iter().map(|r| r.x + r.width).max()?;
         let bottom = usable.iter().map(|r| r.y + r.height).max()?;
-        let bounds = Rect { x: left, y: top, width: right - left, height: bottom - top };
-        let (w, h) = (bounds.width as f64, bounds.height as f64);
-        let scale = 1f64.min(MAX_EDGE / w.max(h)).min((MAX_PIXELS / (w * h)).sqrt());
-        Some(Layout {
+        Some(Layout::fit(Rect { x: left, y: top, width: right - left, height: bottom - top }, 1.0))
+    }
+
+    // `bounds` at up to `max_scale` image pixels per logical pixel.
+    pub fn fit(bounds: Rect, max_scale: f64) -> Layout {
+        let (w, h) = (bounds.width.max(1) as f64, bounds.height.max(1) as f64);
+        let scale = max_scale.min(MAX_EDGE / w.max(h)).min((MAX_PIXELS / (w * h)).sqrt());
+        Layout {
             bounds,
             scale,
             width: ((w * scale).round() as u32).max(1),
             height: ((h * scale).round() as u32).max(1),
-        })
+        }
     }
 
     // The centre of a screenshot pixel, in logical coordinates.
@@ -52,6 +72,21 @@ impl Layout {
             self.bounds.x as f64 + (x + 0.5) / self.scale,
             self.bounds.y as f64 + (y + 0.5) / self.scale,
         )
+    }
+
+    // A logical point in image pixels.
+    pub fn to_image_point(&self, x: f64, y: f64) -> (f64, f64) {
+        ((x - self.bounds.x as f64) * self.scale, (y - self.bounds.y as f64) * self.scale)
+    }
+
+    // The logical area an image rectangle covers, whole pixels outwards, within
+    // the bounds; nothing when it misses them.
+    pub fn to_logical_rect(&self, x: f64, y: f64, width: f64, height: f64) -> Option<Rect> {
+        let left = (self.bounds.x as f64 + x / self.scale).floor() as i32;
+        let top = (self.bounds.y as f64 + y / self.scale).floor() as i32;
+        let right = (self.bounds.x as f64 + (x + width) / self.scale).ceil() as i32;
+        let bottom = (self.bounds.y as f64 + (y + height) / self.scale).ceil() as i32;
+        Rect { x: left, y: top, width: right - left, height: bottom - top }.intersection(&self.bounds)
     }
 
     fn to_image(&self, rect: &Rect) -> (usize, usize, usize, usize) {
@@ -75,38 +110,54 @@ pub struct Frame {
     pub data: Vec<u8>,
 }
 
-// Area weights: each target pixel averages the source span it covers.
-fn weights(source: usize, target: usize) -> Vec<(usize, Vec<f32>)> {
-    let ratio = source as f64 / target as f64;
+// Area weights: each target pixel averages the part of the source span
+// `start..end` it covers, out of `limit` source pixels.
+fn weights(start: f64, end: f64, target: usize, limit: usize) -> Vec<(usize, Vec<f32>)> {
+    let ratio = (end - start) / target as f64;
     (0..target)
         .map(|i| {
-            let start = i as f64 * ratio;
-            let end = (i + 1) as f64 * ratio;
-            let first = start.floor() as usize;
-            let last = (end.ceil() as usize).min(source);
-            let span = end - start;
+            let from = start + i as f64 * ratio;
+            let to = from + ratio;
+            let first = (from.floor() as usize).min(limit - 1);
+            let last = (to.ceil() as usize).clamp(first + 1, limit);
             let weights = (first..last)
-                .map(|j| ((end.min(j as f64 + 1.0) - start.max(j as f64)) / span) as f32)
+                .map(|j| ((to.min(j as f64 + 1.0) - from.max(j as f64)).max(0.0) / ratio) as f32)
                 .collect();
             (first, weights)
         })
         .collect()
 }
 
-// Draws `frame` into `rect` of an RGB canvas the size of `layout`.
+// Draws the part of `frame`, an output at `rect`, that falls in the layout's
+// bounds into an RGB canvas the size of `layout`.
 pub fn draw(canvas: &mut [u8], layout: &Layout, rect: &Rect, frame: &Frame) {
-    let (x0, y0, x1, y1) = layout.to_image(rect);
+    let Some(visible) = rect.intersection(&layout.bounds) else {
+        return;
+    };
+    let (x0, y0, x1, y1) = layout.to_image(&visible);
     let (width, height) = (x1.saturating_sub(x0), y1.saturating_sub(y0));
     if width == 0 || height == 0 || frame.width == 0 || frame.height == 0 {
         return;
     }
-    let columns = weights(frame.width, width);
-    let rows = weights(frame.height, height);
+    let (sx, sy) = (frame.width as f64 / rect.width as f64, frame.height as f64 / rect.height as f64);
+    let span = |from: i32, to: i32, origin: i32, scale: f64| {
+        ((from - origin) as f64 * scale, (to - origin) as f64 * scale)
+    };
+    let (left, right) = span(visible.x, visible.x + visible.width, rect.x, sx);
+    let (top, bottom) = span(visible.y, visible.y + visible.height, rect.y, sy);
+    let columns = weights(left, right, width, frame.width);
+    let mut rows = weights(top, bottom, height, frame.height);
 
-    // Horizontal pass into floats, then vertical into the canvas.
-    let mut narrowed = vec![0f32; frame.height * width * 3];
-    for y in 0..frame.height {
-        let line = &frame.data[y * frame.stride..];
+    // Horizontal pass over the rows in use into floats, then vertical into
+    // the canvas.
+    let first_row = rows[0].0;
+    let last_row = rows.iter().map(|(first, row)| first + row.len()).max().unwrap_or(first_row);
+    for (first, _) in &mut rows {
+        *first -= first_row;
+    }
+    let mut narrowed = vec![0f32; (last_row - first_row) * width * 3];
+    for y in 0..last_row - first_row {
+        let line = &frame.data[(first_row + y) * frame.stride..];
         for (i, (first, column)) in columns.iter().enumerate() {
             let mut sum = [0f32; 3];
             for (k, weight) in column.iter().enumerate() {
@@ -209,6 +260,26 @@ mod tests {
         let mut canvas = vec![0u8; 3];
         draw(&mut canvas, &layout, &Rect { x: 0, y: 0, width: 1, height: 1 }, &frame);
         assert_eq!(canvas, vec![128, 128, 128]);
+    }
+
+    #[test]
+    fn a_zoomed_region_crops_at_the_native_scale() {
+        let screenshot = Layout::of(&[Rect { x: 0, y: 0, width: 4, height: 2 }]).unwrap();
+        let region = screenshot.to_logical_rect(2.0, 0.0, 2.0, 1.0).unwrap();
+        assert_eq!(region, Rect { x: 2, y: 0, width: 2, height: 1 });
+        assert_eq!(screenshot.to_logical_rect(4.0, 0.0, 2.0, 1.0), None);
+
+        // The output is 8x4 pixels for 4x2 logical ones; the region shows its
+        // top right quarter pixel for pixel.
+        let zoomed = Layout::fit(region, 2.0);
+        assert_eq!((zoomed.width, zoomed.height), (4, 2));
+        let data = (0..32u8).flat_map(|i| [i, i, i, 0]).collect();
+        let frame = Frame { width: 8, height: 4, stride: 32, data };
+        let mut canvas = vec![0u8; 4 * 2 * 3];
+        draw(&mut canvas, &zoomed, &Rect { x: 0, y: 0, width: 4, height: 2 }, &frame);
+        let grey: Vec<u8> = canvas.chunks(3).map(|pixel| pixel[0]).collect();
+        assert_eq!(grey, vec![4, 5, 6, 7, 12, 13, 14, 15]);
+        assert_eq!(zoomed.to_image_point(3.0, 0.5), (2.0, 1.0));
     }
 
     #[test]

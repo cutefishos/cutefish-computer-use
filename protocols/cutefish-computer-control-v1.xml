@@ -71,6 +71,14 @@
              summary="the input would reach a dialog that answers for the user"/>
       <entry name="untypable" value="3"
              summary="the text has characters the layout cannot type, and no text field takes them or it mixes them with control keys"/>
+      <entry name="no_window" value="4" summary="the window is gone or cannot be activated"/>
+    </enum>
+
+    <enum name="window_state" bitfield="true">
+      <entry name="active" value="1" summary="the window has the focus"/>
+      <entry name="minimized" value="2"/>
+      <entry name="hidden" value="4" summary="the user hid its application"/>
+      <entry name="other_desk" value="8" summary="the window is on a desk that is not shown"/>
     </enum>
 
     <enum name="state">
@@ -154,6 +162,32 @@
       <arg name="text" type="string"/>
     </request>
 
+    <request name="list_windows">
+      <description summary="list the application windows">
+        Sends a window event for every application window, most recently used
+        first, then windows_done. Rejected as not_granted, with no window
+        events, unless the control is granted.
+      </description>
+    </request>
+
+    <request name="activate_window">
+      <description summary="bring a window forward">
+        Brings the window forward and gives it the focus, as the user's click
+        on its application in the dock does: a minimized or hidden window comes
+        back and a window on another desk brings its desk up. The handle is one
+        a window event of this control named. Rejected as no_window when that
+        window is gone, and as an input request would be otherwise.
+      </description>
+      <arg name="handle" type="uint"/>
+    </request>
+
+    <request name="get_pointer">
+      <description summary="ask where the pointer is">
+        Sends a pointer event, or is rejected as not_granted unless the control
+        is granted.
+      </description>
+    </request>
+
     <event name="granted">
       <description summary="the user allowed the control">
         Input requests take effect from now on.
@@ -171,6 +205,35 @@
     <event name="rejected">
       <description summary="an input request was dropped"/>
       <arg name="reason" type="uint" enum="rejection"/>
+    </event>
+
+    <event name="window">
+      <description summary="an application window">
+        The handle stays the same for the window as long as the control
+        exists. The geometry is the window's frame in the global logical
+        coordinate space, and means nothing while the window is minimized,
+        hidden or on another desk.
+      </description>
+      <arg name="handle" type="uint"/>
+      <arg name="app_id" type="string" summary="xdg_toplevel's app_id, possibly empty"/>
+      <arg name="title" type="string"/>
+      <arg name="x" type="int"/>
+      <arg name="y" type="int"/>
+      <arg name="width" type="int"/>
+      <arg name="height" type="int"/>
+      <arg name="state" type="uint" enum="window_state"/>
+    </event>
+
+    <event name="windows_done">
+      <description summary="the window list is complete"/>
+    </event>
+
+    <event name="pointer">
+      <description summary="where the pointer is">
+        In the global logical coordinate space.
+      </description>
+      <arg name="x" type="fixed"/>
+      <arg name="y" type="fixed"/>
     </event>
   </interface>
 </protocol>

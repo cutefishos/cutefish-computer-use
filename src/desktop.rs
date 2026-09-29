@@ -4,8 +4,6 @@ use std::env;
 use std::fs::File;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
-use std::process::Command;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -28,10 +26,11 @@ use wayland_protocols::xdg::xdg_output::zv1::client::{
 
 use crate::image::{self, Frame, Layout, Rect};
 use crate::keys::Key;
+use crate::session;
 use crate::protocol::cutefish_computer_control_manager_v1::CutefishComputerControlManagerV1 as ControlManager;
 use crate::protocol::cutefish_computer_control_v1::{
     self as control_v1, CutefishComputerControlV1 as Control, Rejection, RevokeReason,
-    State as KeyState,
+    State as KeyState, WindowState,
 };
 
 // How long the user has to answer the permission prompt.
@@ -62,6 +61,20 @@ enum Grant {
     Revoked(Option<RevokeReason>, bool),
 }
 
+// An application window, as the compositor lists it.
+#[derive(Clone, Debug)]
+pub struct Window {
+    pub handle: u32,
+    pub app_id: String,
+    pub title: String,
+    // The frame in logical coordinates.
+    pub rect: Rect,
+    pub active: bool,
+    pub minimized: bool,
+    pub hidden: bool,
+    pub other_desk: bool,
+}
+
 #[derive(Default)]
 struct Capture {
     width: u32,
@@ -81,6 +94,9 @@ struct State {
     grant: Grant,
     rejections: Vec<Rejection>,
     capture: Capture,
+    windows: Vec<Window>,
+    windows_done: bool,
+    pointer: Option<(f64, f64)>,
 }
 
 impl State {
@@ -128,24 +144,10 @@ fn connect_to_display() -> Result<Connection> {
     connect_to_session()
 }
 
-// Some agent apps start MCP servers with a trimmed environment (Claude Desktop
-// passes no Wayland variables); the session exports its display to systemd.
 fn connect_to_session() -> Result<Connection> {
-    // SAFETY: getuid takes no arguments and cannot fail.
-    let uid = unsafe { libc::getuid() };
-    let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(format!("/run/user/{uid}")));
-    let output = Command::new("systemctl")
-        .args(["--user", "show-environment"])
-        .env("XDG_RUNTIME_DIR", &runtime_dir)
-        .output()
-        .map_err(|e| format!("Cannot find the Wayland display of the session: {e}"))?;
-    let display = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .find_map(|line| line.strip_prefix("WAYLAND_DISPLAY=").map(str::to_string))
+    let display = session::exported("WAYLAND_DISPLAY")
         .ok_or("Cannot find the Wayland display of the session.")?;
-    let stream = UnixStream::connect(runtime_dir.join(&display))
+    let stream = UnixStream::connect(session::runtime_dir().join(&display))
         .map_err(|e| format!("Cannot connect to the Wayland display {display}: {e}"))?;
     Connection::from_socket(stream)
         .map_err(|e| format!("Cannot connect to the Wayland display {display}: {e}"))
@@ -180,6 +182,10 @@ impl Batch<'_> {
 
     pub fn type_text(&mut self, text: &str) {
         self.control.type_text(text.to_string());
+    }
+
+    pub fn activate_window(&mut self, handle: u32) {
+        self.control.activate_window(handle);
     }
 
     pub fn pause(&mut self, milliseconds: u64) {
@@ -233,6 +239,9 @@ impl Desktop {
             grant: Grant::None,
             rejections: Vec::new(),
             capture: Capture::default(),
+            windows: Vec::new(),
+            windows_done: false,
+            pointer: None,
         };
         let registry = globals.registry().clone();
         globals.contents().with_list(|list| {
@@ -378,6 +387,9 @@ impl Desktop {
             if rejections.contains(&Rejection::Untypable) {
                 return Ok(false);
             }
+            if rejections.contains(&Rejection::NoWindow) {
+                return Err("That window is gone. List the windows again.".into());
+            }
             if rejections.contains(&Rejection::Paused) {
                 if Instant::now() + PAUSE_RETRY < deadline {
                     sleep(PAUSE_RETRY);
@@ -389,33 +401,91 @@ impl Desktop {
         }
     }
 
+    // Sends a query and waits for its answer: the control must be granted.
+    fn query(&mut self, send: impl Fn(&Control)) -> Result<()> {
+        let control = self.ensure_control()?;
+        self.state.rejections.clear();
+        send(&control);
+        self.queue.roundtrip(&mut self.state).map_err(protocol_error)?;
+        if let Grant::Revoked(reason, false) = self.state.grant {
+            self.state.grant = Grant::Revoked(reason, true);
+            self.drop_control();
+            return Err(revoke_message(reason));
+        }
+        if !std::mem::take(&mut self.state.rejections).is_empty() {
+            return Err("The compositor did not answer.".into());
+        }
+        Ok(())
+    }
+
     fn output_rects(&self) -> Vec<Rect> {
         self.state.outputs.iter().map(|o| o.rect).collect()
     }
 
+    // The latest screenshot's layout, which every x and y refers to.
+    pub fn layout(&mut self) -> Result<Layout> {
+        self.pump()?;
+        match self.layout {
+            Some(layout) => Ok(layout),
+            None => Layout::of(&self.output_rects()).ok_or_else(|| "There is no display.".into()),
+        }
+    }
+
     // Screenshot pixels to logical coordinates, by the latest screenshot.
     pub fn to_logical(&mut self, x: f64, y: f64) -> Result<(f64, f64)> {
-        self.pump()?;
-        let layout = match self.layout {
-            Some(layout) => layout,
-            None => Layout::of(&self.output_rects()).ok_or("There is no display.")?,
-        };
-        Ok(layout.to_logical(x, y))
+        Ok(self.layout()?.to_logical(x, y))
+    }
+
+    // Application windows, most recently used first.
+    pub fn windows(&mut self) -> Result<Vec<Window>> {
+        self.state.windows.clear();
+        self.state.windows_done = false;
+        self.query(|control| control.list_windows())?;
+        if !self.state.windows_done {
+            return Err("The compositor did not list the windows.".into());
+        }
+        Ok(std::mem::take(&mut self.state.windows))
+    }
+
+    // Where the pointer is, in logical coordinates.
+    pub fn pointer(&mut self) -> Result<(f64, f64)> {
+        self.state.pointer = None;
+        self.query(|control| control.get_pointer())?;
+        self.state.pointer.ok_or_else(|| "The compositor did not tell where the pointer is.".into())
     }
 
     pub fn screenshot(&mut self) -> Result<(Vec<u8>, &'static str, Layout)> {
         self.ensure_control()?;
         let layout = Layout::of(&self.output_rects()).ok_or("There is no display.")?;
-        let mut canvas = vec![0u8; layout.width as usize * layout.height as usize * 3];
-        let outputs: Vec<(wl_output::WlOutput, Rect)> =
-            self.state.outputs.iter().map(|o| (o.output.clone(), o.rect)).collect();
-        for (output, rect) in outputs {
-            let frame = self.capture(&output)?;
-            image::draw(&mut canvas, &layout, &rect, &frame);
-        }
-        let (data, mime_type) = image::encode(&canvas, layout.width, layout.height)?;
+        let frames = self.capture_all()?;
+        let (data, mime_type) = render(&layout, &frames)?;
         self.layout = Some(layout);
         Ok((data, mime_type, layout))
+    }
+
+    // Part of the latest screenshot, at up to the displays' own resolution.
+    // The latest screenshot stays what coordinates refer to.
+    pub fn zoom(&mut self, x: f64, y: f64, width: f64, height: f64) -> Result<(Vec<u8>, &'static str, Layout)> {
+        let region = self
+            .layout()?
+            .to_logical_rect(x, y, width, height)
+            .ok_or("That region is outside the screenshot.")?;
+        self.ensure_control()?;
+        let frames = self.capture_all()?;
+        let native = frames
+            .iter()
+            .filter(|(rect, _)| rect.intersection(&region).is_some())
+            .map(|(rect, frame)| frame.width as f64 / rect.width as f64)
+            .fold(1.0, f64::max);
+        let layout = Layout::fit(region, native);
+        let (data, mime_type) = render(&layout, &frames)?;
+        Ok((data, mime_type, layout))
+    }
+
+    fn capture_all(&mut self) -> Result<Vec<(Rect, Frame)>> {
+        let outputs: Vec<(wl_output::WlOutput, Rect)> =
+            self.state.outputs.iter().map(|o| (o.output.clone(), o.rect)).collect();
+        outputs.into_iter().map(|(output, rect)| Ok((rect, self.capture(&output)?))).collect()
     }
 
     fn capture(&mut self, output: &wl_output::WlOutput) -> Result<Frame> {
@@ -486,6 +556,14 @@ impl Desktop {
         }
         Ok(Frame { width, height, stride, data: memory.to_vec() })
     }
+}
+
+fn render(layout: &Layout, frames: &[(Rect, Frame)]) -> Result<(Vec<u8>, &'static str)> {
+    let mut canvas = vec![0u8; layout.width as usize * layout.height as usize * 3];
+    for (rect, frame) in frames {
+        image::draw(&mut canvas, layout, rect, frame);
+    }
+    image::encode(&canvas, layout.width, layout.height)
 }
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
@@ -564,6 +642,30 @@ impl Dispatch<Control, ()> for State {
                     state.rejections.push(reason);
                 }
             }
+            control_v1::Event::Window {
+                handle,
+                app_id,
+                title,
+                x,
+                y,
+                width,
+                height,
+                state: flags,
+            } => {
+                let flags = flags.into_result().unwrap_or(WindowState::empty());
+                state.windows.push(Window {
+                    handle,
+                    app_id,
+                    title,
+                    rect: Rect { x, y, width, height },
+                    active: flags.contains(WindowState::Active),
+                    minimized: flags.contains(WindowState::Minimized),
+                    hidden: flags.contains(WindowState::Hidden),
+                    other_desk: flags.contains(WindowState::OtherDesk),
+                });
+            }
+            control_v1::Event::WindowsDone => state.windows_done = true,
+            control_v1::Event::Pointer { x, y } => state.pointer = Some((x, y)),
         }
     }
 }

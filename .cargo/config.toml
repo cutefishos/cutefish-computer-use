@@ -1,0 +1,9 @@
+# Builds offline against the crates Debian packages as librust-*-dev.
+[source.crates-io]
+replace-with = "debian"
+
+[source.debian]
+directory = "/usr/share/cargo/registry"
+
+[net]
+offline = true

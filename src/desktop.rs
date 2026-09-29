@@ -8,7 +8,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
-use wayland_client::protocol::{wl_buffer, wl_output, wl_registry, wl_shm, wl_shm_pool};
+use wayland_client::protocol::{wl_buffer, wl_callback, wl_output, wl_registry, wl_shm, wl_shm_pool};
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum};
 use wayland_protocols::ext::image_capture_source::v1::client::{
     ext_image_capture_source_v1::ExtImageCaptureSourceV1,
@@ -97,6 +97,7 @@ struct State {
     windows: Vec<Window>,
     windows_done: bool,
     pointer: Option<(f64, f64)>,
+    settled: Option<bool>,
 }
 
 impl State {
@@ -255,6 +256,7 @@ impl Desktop {
             windows: Vec::new(),
             windows_done: false,
             pointer: None,
+            settled: None,
         };
         let registry = globals.registry().clone();
         globals.contents().with_list(|list| {
@@ -414,6 +416,22 @@ impl Desktop {
         }
     }
 
+    // Waits until the screen stops changing and the focused applications have
+    // read their input, for at most `timeout`; false when it did not settle.
+    pub fn settle(&mut self, timeout: Duration) -> Result<bool> {
+        let Some(control) = self.state.control.clone() else {
+            return Ok(true);
+        };
+        self.state.settled = None;
+        let milliseconds = timeout.as_millis().min(u32::MAX as u128) as u32;
+        let _callback = control.settle(milliseconds, &self.qh, ());
+        // The compositor answers by the timeout; the margin covers a busy one.
+        self.dispatch_until(Instant::now() + timeout + Duration::from_secs(1), |s| {
+            s.settled.is_some()
+        })?;
+        Ok(self.state.settled.unwrap_or(false))
+    }
+
     // Sends a query and waits for its answer: the control must be granted.
     fn query(&mut self, send: impl Fn(&Control)) -> Result<()> {
         let control = self.ensure_control()?;
@@ -483,6 +501,23 @@ impl Desktop {
             .layout()?
             .to_logical_rect(x, y, width, height)
             .ok_or("That region is outside the screenshot.")?;
+        self.crop(region)
+    }
+
+    // A window's frame as it shows on screen, at up to the displays' own
+    // resolution; coordinates refer to this image from now on.
+    pub fn window_screenshot(&mut self, frame: Rect) -> Result<(Vec<u8>, &'static str, Layout)> {
+        let region = Layout::of(&self.output_rects())
+            .and_then(|desktop| frame.intersection(&desktop.bounds))
+            .ok_or("That window is off the screen.")?;
+        let (data, mime_type, layout) = self.crop(region)?;
+        self.layout = Some(layout);
+        Ok((data, mime_type, layout))
+    }
+
+    // A logical region of the screen at the highest resolution among the
+    // displays it covers.
+    fn crop(&mut self, region: Rect) -> Result<(Vec<u8>, &'static str, Layout)> {
         self.ensure_control()?;
         let frames = self.capture_all()?;
         let native = frames
@@ -723,6 +758,21 @@ impl Dispatch<ExtImageCopyCaptureFrameV1, ()> for State {
             Event::Ready => state.capture.ready = true,
             Event::Failed { .. } => state.capture.failed = true,
             _ => {}
+        }
+    }
+}
+
+impl Dispatch<wl_callback::WlCallback, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &wl_callback::WlCallback,
+        event: wl_callback::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_callback::Event::Done { callback_data } = event {
+            state.settled = Some(callback_data == 1);
         }
     }
 }

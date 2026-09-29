@@ -230,6 +230,19 @@
       <arg name="fd" type="fd"/>
     </request>
 
+    <request name="settle">
+      <description summary="wait for the screen to settle">
+        The callback's done event comes once no output has drawn a frame and
+        the clients with the keyboard and pointer focus have read every event
+        sent to them, both for a short while, so a capture shows what earlier
+        requests led to. Its data is 1 then, or 0 when the timeout passed
+        first, as it does while something animates. Works in any state of the
+        control.
+      </description>
+      <arg name="callback" type="new_id" interface="wl_callback"/>
+      <arg name="timeout" type="uint" summary="milliseconds, at most 10000"/>
+    </request>
+
     <event name="granted">
       <description summary="the user allowed the control">
         Input requests take effect from now on.

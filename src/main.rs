@@ -30,8 +30,9 @@ const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 // connection, and a commit overtakes keys still queued.
 const TEXT_BURST: usize = 32;
 const TEXT_PAUSE: Duration = Duration::from_millis(100);
-// A restored window or a desk switch animates for about this long.
-const WINDOW_SETTLE: Duration = Duration::from_millis(400);
+// The longest to wait for the screen to settle after a window change or
+// before a screenshot in actions; something that keeps animating costs this.
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(1);
 // How long a started application gets to show a window before the tool returns.
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(5);
 const LAUNCH_POLL: Duration = Duration::from_millis(250);
@@ -48,12 +49,10 @@ const READ_ONLY_TOOLS: &[&str] = &[
 // The compositor reads no more than this.
 const MAX_CLIPBOARD_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ACTION_STEPS: usize = 50;
-// An application shows input a moment after it arrives, which the agent's own
-// round trip covers between single calls but not inside actions.
-const ACTION_SETTLE: Duration = Duration::from_millis(500);
 
 const INSTRUCTIONS: &str = "Controls the Cutefish desktop the user is sitting at. \
 Take a screenshot first: every x and y is a pixel of the latest screenshot. \
+A screenshot of one window shows it at full resolution in fewer pixels. \
 Use zoom to read small text. Prefer open_application, open and \
 activate_window over clicking through the desktop to reach an application, \
 and close_window and set_window_frame over dragging window edges. \
@@ -74,15 +73,18 @@ fn tools() -> Value {
     let mut tools = json!([
         {
             "name": "screenshot",
-            "description": "Captures the whole desktop, every display, as one image. Coordinates of the other tools are pixels of the latest screenshot. Give a delay to let an application start or a page load first.",
+            "description": "Captures the whole desktop, every display, as one image, or only one window's frame at up to the display's full resolution. Coordinates of the other tools are pixels of the latest screenshot, a window's one included. Give a delay to let an application start or a page load first.",
             "inputSchema": {
                 "type": "object",
-                "properties": { "delay": { "type": "number", "minimum": 0, "maximum": MAX_DELAY_SECONDS, "description": "Seconds to wait before capturing." } }
+                "properties": {
+                    "delay": { "type": "number", "minimum": 0, "maximum": MAX_DELAY_SECONDS, "description": "Seconds to wait before capturing." },
+                    "window": { "type": "integer", "description": "A window number from list_windows. Whatever covers the window shows too: activate it first." }
+                }
             }
         },
         {
             "name": "zoom",
-            "description": "Captures the screen again and shows one region of it at up to the display's full resolution, to read small text. No screenshot is needed first. The region is in pixels of the latest screenshot, and the other tools' coordinates still refer to the whole screenshot.",
+            "description": "Captures the screen again and shows one region of it at up to the display's full resolution, to read small text. No screenshot is needed first. The region is in pixels of the latest screenshot, and the other tools' coordinates still refer to that screenshot.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -582,9 +584,11 @@ impl Server {
             let number = index + 1;
             let name = step["tool"].as_str().unwrap_or_default();
             let step_arguments = step.get("arguments").unwrap_or(&no_arguments);
+            // An application shows input a moment after it arrives, which the
+            // agent's own round trip covers between single calls.
             if matches!(name, "screenshot" | "zoom") {
                 if acted && step_arguments.get("delay").is_none() {
-                    sleep(ACTION_SETTLE);
+                    self.desktop()?.settle(SETTLE_TIMEOUT)?;
                 }
                 acted = false;
             } else if !READ_ONLY_TOOLS.contains(&name) {
@@ -627,7 +631,33 @@ impl Server {
                     Some(_) => number(arguments, "delay")?.clamp(0.0, MAX_DELAY_SECONDS),
                 };
                 sleep(Duration::from_secs_f64(delay));
-                let (data, mime_type, layout) = self.desktop()?.screenshot()?;
+                let desktop = self.desktop()?;
+                let window = match arguments.get("window") {
+                    None | Some(Value::Null) => None,
+                    Some(_) => {
+                        let handle = window_handle(arguments)?;
+                        let windows = desktop.windows()?;
+                        let window = windows
+                            .into_iter()
+                            .find(|window| window.handle == handle)
+                            .ok_or("That window is gone; list the windows again.")?;
+                        if window.minimized || window.hidden || window.other_desk {
+                            return Err("That window is not on screen: activate it first.".into());
+                        }
+                        Some(window)
+                    }
+                };
+                let (data, mime_type, layout) = match &window {
+                    Some(window) => desktop.window_screenshot(window.rect)?,
+                    None => desktop.screenshot()?,
+                };
+                let caption = match &window {
+                    Some(window) => format!(
+                        "Window {} \"{}\" at {}x{} pixels. The other tools' coordinates now refer to this image.",
+                        window.handle, window.title, layout.width, layout.height
+                    ),
+                    None => format!("The desktop at {}x{} pixels.", layout.width, layout.height),
+                };
                 Ok(json!({ "content": [
                     {
                         "type": "image",
@@ -636,7 +666,7 @@ impl Server {
                     },
                     {
                         "type": "text",
-                        "text": format!("The desktop at {}x{} pixels.", layout.width, layout.height)
+                        "text": caption
                     }
                 ] }))
             }
@@ -656,7 +686,7 @@ impl Server {
                     {
                         "type": "text",
                         "text": format!(
-                            "Screenshot pixels {x},{y} to {},{} at {}x{} pixels. Coordinates still refer to the whole screenshot.",
+                            "Screenshot pixels {x},{y} to {},{} at {}x{} pixels. Coordinates still refer to the screenshot.",
                             x + width,
                             y + height,
                             layout.width,
@@ -856,14 +886,16 @@ impl Server {
             }
             "activate_window" => {
                 let handle = window_handle(arguments)?;
-                self.desktop()?.inject(&|batch| batch.activate_window(handle))?;
-                sleep(WINDOW_SETTLE);
+                let desktop = self.desktop()?;
+                desktop.inject(&|batch| batch.activate_window(handle))?;
+                desktop.settle(SETTLE_TIMEOUT)?;
                 Ok(text("Activated."))
             }
             "close_window" => {
                 let handle = window_handle(arguments)?;
-                self.desktop()?.inject(&|batch| batch.close_window(handle))?;
-                sleep(WINDOW_SETTLE);
+                let desktop = self.desktop()?;
+                desktop.inject(&|batch| batch.close_window(handle))?;
+                desktop.settle(SETTLE_TIMEOUT)?;
                 Ok(text("Asked the window to close."))
             }
             "set_window_frame" => {
@@ -877,7 +909,7 @@ impl Server {
                     number(arguments, "height")?,
                 );
                 desktop.inject(&|batch| batch.set_window_frame(handle, frame))?;
-                sleep(WINDOW_SETTLE);
+                desktop.settle(SETTLE_TIMEOUT)?;
                 let windows = desktop.windows()?;
                 let window = windows
                     .iter()

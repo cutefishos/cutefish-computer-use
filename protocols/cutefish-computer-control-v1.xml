@@ -54,6 +54,8 @@
 
     <enum name="error">
       <entry name="invalid_state" value="0" summary="a button or key state is neither released nor pressed"/>
+      <entry name="invalid_clipboard" value="1"
+             summary="the clipboard fd is not a regular file, or is too large"/>
     </enum>
 
     <enum name="revoke_reason">
@@ -71,7 +73,8 @@
              summary="the input would reach a dialog that answers for the user"/>
       <entry name="untypable" value="3"
              summary="the text has characters the layout cannot type, and no text field takes them or it mixes them with control keys"/>
-      <entry name="no_window" value="4" summary="the window is gone or cannot be activated"/>
+      <entry name="no_window" value="4"
+             summary="the window is gone or cannot take the window request"/>
     </enum>
 
     <enum name="window_state" bitfield="true">
@@ -186,6 +189,45 @@
         Sends a pointer event, or is rejected as not_granted unless the control
         is granted.
       </description>
+    </request>
+
+    <request name="close_window">
+      <description summary="ask a window to close">
+        Asks the window to close, as its close button does; the application may
+        ask the user first. A window that stopped responding is killed. Rejected
+        as no_window when the window is gone or cannot be closed, as protected
+        when it belongs to the process that shows system dialogs, and as an
+        input request would be otherwise.
+      </description>
+      <arg name="handle" type="uint"/>
+    </request>
+
+    <request name="set_window_frame">
+      <description summary="move and resize a window">
+        Moves the window's frame to the given geometry in the global logical
+        coordinate space. A maximized, full-screen or snapped window becomes a
+        normal one. The size is kept within the window's limits, and kept as
+        it is when the window cannot be resized; the frame is kept on screen
+        enough to grab. Rejected as no_window when the window is gone,
+        minimized, hidden or on another desk, and as close_window is otherwise.
+      </description>
+      <arg name="handle" type="uint"/>
+      <arg name="x" type="int"/>
+      <arg name="y" type="int"/>
+      <arg name="width" type="int"/>
+      <arg name="height" type="int"/>
+    </request>
+
+    <request name="set_clipboard">
+      <description summary="put text on the clipboard">
+        Replaces the clipboard with the text, as copying it would; the agent
+        pastes it with the application's shortcut. The fd is a regular file,
+        such as a memfd, holding UTF-8 text of at most 16 MiB; the compositor
+        reads it at once and closes it. The text is offered as
+        text/plain;charset=utf-8, text/plain, UTF8_STRING, STRING and TEXT.
+        Rejected as an input request would be.
+      </description>
+      <arg name="fd" type="fd"/>
     </request>
 
     <event name="granted">

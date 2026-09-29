@@ -188,6 +188,19 @@ impl Batch<'_> {
         self.control.activate_window(handle);
     }
 
+    pub fn close_window(&mut self, handle: u32) {
+        self.control.close_window(handle);
+    }
+
+    pub fn set_window_frame(&mut self, handle: u32, frame: Rect) {
+        self.control.set_window_frame(handle, frame.x, frame.y, frame.width, frame.height);
+    }
+
+    // `text` is a file holding the text, such as a memfd.
+    pub fn set_clipboard(&mut self, text: &File) {
+        self.control.set_clipboard(text.as_fd());
+    }
+
     pub fn pause(&mut self, milliseconds: u64) {
         let _ = self.connection.flush();
         sleep(Duration::from_millis(milliseconds));
@@ -388,7 +401,7 @@ impl Desktop {
                 return Ok(false);
             }
             if rejections.contains(&Rejection::NoWindow) {
-                return Err("That window is gone. List the windows again.".into());
+                return Err("That window is gone or cannot do that; list the windows again. Activate a minimized, hidden or other-desk window before moving it.".into());
             }
             if rejections.contains(&Rejection::Paused) {
                 if Instant::now() + PAUSE_RETRY < deadline {

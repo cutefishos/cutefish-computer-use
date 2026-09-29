@@ -79,6 +79,17 @@ impl Layout {
         ((x - self.bounds.x as f64) * self.scale, (y - self.bounds.y as f64) * self.scale)
     }
 
+    // A window frame given in image pixels, in logical pixels; it may reach off
+    // the desktop, which the compositor limits.
+    pub fn to_logical_frame(&self, x: f64, y: f64, width: f64, height: f64) -> Rect {
+        Rect {
+            x: (self.bounds.x as f64 + x / self.scale).round() as i32,
+            y: (self.bounds.y as f64 + y / self.scale).round() as i32,
+            width: (width / self.scale).round().max(1.0) as i32,
+            height: (height / self.scale).round().max(1.0) as i32,
+        }
+    }
+
     // The logical area an image rectangle covers, whole pixels outwards, within
     // the bounds; nothing when it misses them.
     pub fn to_logical_rect(&self, x: f64, y: f64, width: f64, height: f64) -> Option<Rect> {
@@ -245,6 +256,13 @@ mod tests {
         assert!((layout.width * layout.height) as f64 <= MAX_PIXELS * 1.01);
         let (x, _) = layout.to_logical(layout.width as f64 - 1.0, 0.0);
         assert!(x < 3840.0 && x > 3835.0);
+    }
+
+    #[test]
+    fn a_window_frame_is_scaled_back_to_logical_pixels() {
+        let layout = Layout { bounds: Rect { x: -100, y: 0, width: 2000, height: 1000 }, scale: 0.5, width: 1000, height: 500 };
+        assert_eq!(layout.to_logical_frame(100.0, 50.0, 300.0, 200.0), Rect { x: 100, y: 100, width: 600, height: 400 });
+        assert_eq!(layout.to_logical_frame(0.0, 0.0, 0.0, -5.0), Rect { x: -100, y: 0, width: 1, height: 1 });
     }
 
     #[test]

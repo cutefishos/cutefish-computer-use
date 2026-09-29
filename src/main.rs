@@ -7,9 +7,12 @@ mod image;
 mod keys;
 mod protocol;
 mod session;
+mod shortcuts;
 
 use std::collections::HashSet;
+use std::fs::File;
 use std::io::{self, BufRead, Write};
+use std::os::fd::FromRawFd;
 use std::path::Path;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -33,11 +36,27 @@ const WINDOW_SETTLE: Duration = Duration::from_millis(400);
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(5);
 const LAUNCH_POLL: Duration = Duration::from_millis(250);
 const MAX_HOLD_SECONDS: f64 = 10.0;
+const MAX_DELAY_SECONDS: f64 = 30.0;
+const READ_ONLY_TOOLS: &[&str] = &[
+    "screenshot",
+    "zoom",
+    "cursor_position",
+    "keyboard_shortcuts",
+    "list_windows",
+    "list_applications",
+];
+// The compositor reads no more than this.
+const MAX_CLIPBOARD_BYTES: usize = 16 * 1024 * 1024;
 
 const INSTRUCTIONS: &str = "Controls the Cutefish desktop the user is sitting at. \
 Take a screenshot first: every x and y is a pixel of the latest screenshot. \
 Use zoom to read small text. Prefer open_application, open and \
-activate_window over clicking through the desktop to reach an application. \
+activate_window over clicking through the desktop to reach an application, \
+and close_window and set_window_frame over dragging window edges. \
+Call keyboard_shortcuts before using shortcuts: the shortcut key may be \
+Command (super) or Ctrl. For long or multi-line text, or an editor that \
+indents and closes brackets by itself, set_clipboard and paste instead of \
+type_text. \
 The first action asks the user for permission. \
 Input pauses while the user uses the pointer or keyboard, and system dialogs \
 (permission and password prompts) are only for the user to answer.";
@@ -46,15 +65,18 @@ fn tools() -> Value {
     let point = |description: &str| {
         json!({ "type": "number", "description": description })
     };
-    json!([
+    let mut tools = json!([
         {
             "name": "screenshot",
-            "description": "Captures the whole desktop, every display, as one image. Coordinates of the other tools are pixels of the latest screenshot.",
-            "inputSchema": { "type": "object", "properties": {} }
+            "description": "Captures the whole desktop, every display, as one image. Coordinates of the other tools are pixels of the latest screenshot. Give a delay to let an application start or a page load first.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "delay": { "type": "number", "minimum": 0, "maximum": MAX_DELAY_SECONDS, "description": "Seconds to wait before capturing." } }
+            }
         },
         {
             "name": "zoom",
-            "description": "Shows a region of the latest screenshot at up to the display's full resolution, to read small text. Coordinates of the other tools still refer to the whole screenshot.",
+            "description": "Captures the screen again and shows one region of it at up to the display's full resolution, to read small text. No screenshot is needed first. The region is in pixels of the latest screenshot, and the other tools' coordinates still refer to the whole screenshot.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -185,8 +207,22 @@ fn tools() -> Value {
             }
         },
         {
+            "name": "set_clipboard",
+            "description": "Puts text on the clipboard, replacing what the user copied, to paste with the application's paste shortcut. Faster and more exact than type_text for long or multi-line text.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "text": { "type": "string" } },
+                "required": ["text"]
+            }
+        },
+        {
+            "name": "keyboard_shortcuts",
+            "description": "Tells which key applications use for shortcuts (Command or Ctrl) and lists the system shortcuts, as press_keys chords.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
             "name": "list_windows",
-            "description": "Lists the application windows on every desk, most recently used first, with their numbers for activate_window and their frames in screenshot pixels.",
+            "description": "Lists the application windows on every desk, most recently used first, with their numbers for the window tools and their frames in screenshot pixels.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
@@ -196,6 +232,30 @@ fn tools() -> Value {
                 "type": "object",
                 "properties": { "window": { "type": "integer", "description": "The number list_windows gave it." } },
                 "required": ["window"]
+            }
+        },
+        {
+            "name": "close_window",
+            "description": "Asks a window to close, as its close button does. The application may ask about unsaved work first: take a screenshot afterwards.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "window": { "type": "integer", "description": "The number list_windows gave it." } },
+                "required": ["window"]
+            }
+        },
+        {
+            "name": "set_window_frame",
+            "description": "Moves and resizes a window's frame, in screenshot pixels. A maximized or full-screen window becomes a normal one; the window keeps to its size limits and stays on screen enough to grab. Returns the frame it got.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "window": { "type": "integer", "description": "The number list_windows gave it." },
+                    "x": point("Left edge of the frame."),
+                    "y": point("Top edge of the frame."),
+                    "width": point("Frame width."),
+                    "height": point("Frame height.")
+                },
+                "required": ["window", "x", "y", "width", "height"]
             }
         },
         {
@@ -220,17 +280,15 @@ fn tools() -> Value {
                 "properties": { "target": { "type": "string", "description": "An absolute path, a path starting with ~/, or a URL." } },
                 "required": ["target"]
             }
-        },
-        {
-            "name": "wait",
-            "description": "Waits, e.g. for an application to start.",
-            "inputSchema": {
-                "type": "object",
-                "properties": { "seconds": { "type": "number", "minimum": 0, "maximum": 30 } },
-                "required": ["seconds"]
-            }
         }
-    ])
+    ]);
+    // Agent apps may ask the user before each tool; these only look.
+    for tool in tools.as_array_mut().into_iter().flatten() {
+        if READ_ONLY_TOOLS.contains(&tool["name"].as_str().unwrap_or_default()) {
+            tool["annotations"] = json!({ "readOnlyHint": true });
+        }
+    }
+    tools
 }
 
 fn text(message: impl Into<String>) -> Value {
@@ -319,6 +377,28 @@ fn segments(text: &str) -> Vec<&str> {
 }
 
 // A point, when both x and y are given.
+// A memfd holding `bytes`, read from the start.
+fn memory_file(bytes: &[u8]) -> Result<File, String> {
+    let failed = |_| "Could not hold the text.".to_string();
+    // SAFETY: the name is a NUL-terminated literal.
+    let fd = unsafe { libc::memfd_create(c"cutefish-clipboard".as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        return Err("Could not hold the text.".into());
+    }
+    // SAFETY: memfd_create returned a new descriptor that nothing else owns.
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    file.write_all(bytes).map_err(failed)?;
+    Ok(file)
+}
+
+fn window_handle(arguments: &Value) -> Result<u32, String> {
+    arguments
+        .get("window")
+        .and_then(Value::as_u64)
+        .and_then(|handle| u32::try_from(handle).ok())
+        .ok_or_else(|| "\"window\" must be a number from list_windows.".to_string())
+}
+
 fn optional_point(desktop: &mut Desktop, arguments: &Value) -> Result<Option<(f64, f64)>, String> {
     match (arguments.get("x"), arguments.get("y")) {
         (Some(_), Some(_)) => {
@@ -445,6 +525,11 @@ impl Server {
     fn call(&mut self, name: &str, arguments: &Value) -> Result<Value, String> {
         match name {
             "screenshot" => {
+                let delay = match arguments.get("delay") {
+                    None | Some(Value::Null) => 0.0,
+                    Some(_) => number(arguments, "delay")?.clamp(0.0, MAX_DELAY_SECONDS),
+                };
+                sleep(Duration::from_secs_f64(delay));
                 let (data, mime_type, layout) = self.desktop()?.screenshot()?;
                 Ok(json!({ "content": [
                     {
@@ -645,6 +730,21 @@ impl Server {
                 })?;
                 Ok(text("Held."))
             }
+            "set_clipboard" => {
+                let content = string(arguments, "text")?;
+                if content.len() > MAX_CLIPBOARD_BYTES {
+                    return Err("The text is over 16 MiB.".into());
+                }
+                let file = memory_file(content.as_bytes())?;
+                self.desktop()?.inject(&|batch| batch.set_clipboard(&file))?;
+                Ok(text("On the clipboard."))
+            }
+            "keyboard_shortcuts" => {
+                let convention = session::shortcut_convention()
+                    .ok_or("The compositor did not say which shortcut key is in use.")?;
+                let accelerators = session::accelerators().unwrap_or_default();
+                Ok(text(shortcuts::describe(&convention, &accelerators)))
+            }
             "list_windows" => {
                 let desktop = self.desktop()?;
                 let windows = desktop.windows()?;
@@ -658,14 +758,35 @@ impl Server {
                 Ok(text(lines.join("\n")))
             }
             "activate_window" => {
-                let handle = arguments
-                    .get("window")
-                    .and_then(Value::as_u64)
-                    .and_then(|handle| u32::try_from(handle).ok())
-                    .ok_or("\"window\" must be a number from list_windows.")?;
+                let handle = window_handle(arguments)?;
                 self.desktop()?.inject(&|batch| batch.activate_window(handle))?;
                 sleep(WINDOW_SETTLE);
                 Ok(text("Activated."))
+            }
+            "close_window" => {
+                let handle = window_handle(arguments)?;
+                self.desktop()?.inject(&|batch| batch.close_window(handle))?;
+                sleep(WINDOW_SETTLE);
+                Ok(text("Asked the window to close."))
+            }
+            "set_window_frame" => {
+                let handle = window_handle(arguments)?;
+                let desktop = self.desktop()?;
+                let layout = desktop.layout()?;
+                let frame = layout.to_logical_frame(
+                    number(arguments, "x")?,
+                    number(arguments, "y")?,
+                    number(arguments, "width")?,
+                    number(arguments, "height")?,
+                );
+                desktop.inject(&|batch| batch.set_window_frame(handle, frame))?;
+                sleep(WINDOW_SETTLE);
+                let windows = desktop.windows()?;
+                let window = windows
+                    .iter()
+                    .find(|window| window.handle == handle)
+                    .ok_or("The window closed.")?;
+                Ok(text(describe_window(window, &apps::named(), &layout)))
             }
             "list_applications" => {
                 let lines: Vec<String> = apps::installed()
@@ -687,11 +808,6 @@ impl Server {
                 session::open(&target)?;
                 let window = self.new_window(&before)?;
                 Ok(text(format!("Opened {target}. {window}")))
-            }
-            "wait" => {
-                let seconds = number(arguments, "seconds")?.clamp(0.0, 30.0);
-                sleep(Duration::from_secs_f64(seconds));
-                Ok(text("Waited."))
             }
             _ => Err(format!("Unknown tool \"{name}\".")),
         }

@@ -1,9 +1,12 @@
-// The user's session: its environment and its application runtime.
+// The user's session: its environment, its application runtime and its
+// keyboard shortcuts.
 
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::OnceLock;
+
+use serde_json::Value;
 
 pub fn runtime_dir() -> PathBuf {
     env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(|| {
@@ -70,4 +73,39 @@ pub fn launch_application(id: &str) -> Result<u32, String> {
 // Opens a file or URL in its default application, as the shell does.
 pub fn open(target: &str) -> Result<u32, String> {
     call_app_runtime("launchCommand", "sass", &["", "2", "xdg-open", target, ""])
+}
+
+// Runs busctl on the session bus and returns the "data" of its JSON answer.
+fn busctl(arguments: &[&str]) -> Option<Value> {
+    let output = Command::new("busctl")
+        .args(["--user", "--json=short", "--"])
+        .args(arguments)
+        .env("XDG_RUNTIME_DIR", runtime_dir())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut answer: Value = serde_json::from_slice(&output.stdout).ok()?;
+    Some(answer["data"].take())
+}
+
+const SHORTCUTS: [&str; 3] =
+    ["com.cutefish.Shortcuts1", "/com/cutefish/Shortcuts1", "com.cutefish.Shortcuts1"];
+
+// "command" or "pc".
+pub fn shortcut_convention() -> Option<String> {
+    let [service, path, interface] = SHORTCUTS;
+    busctl(&["get-property", service, path, interface, "shortcutConvention"])?
+        .as_str()
+        .map(str::to_string)
+}
+
+// The accelerator table as JSON.
+pub fn accelerators() -> Option<String> {
+    let [service, path, interface] = SHORTCUTS;
+    busctl(&["call", service, path, interface, "accelerators"])?
+        .get(0)?
+        .as_str()
+        .map(str::to_string)
 }

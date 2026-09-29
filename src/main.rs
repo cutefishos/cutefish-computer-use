@@ -47,6 +47,10 @@ const READ_ONLY_TOOLS: &[&str] = &[
 ];
 // The compositor reads no more than this.
 const MAX_CLIPBOARD_BYTES: usize = 16 * 1024 * 1024;
+const MAX_ACTION_STEPS: usize = 50;
+// An application shows input a moment after it arrives, which the agent's own
+// round trip covers between single calls but not inside actions.
+const ACTION_SETTLE: Duration = Duration::from_millis(500);
 
 const INSTRUCTIONS: &str = "Controls the Cutefish desktop the user is sitting at. \
 Take a screenshot first: every x and y is a pixel of the latest screenshot. \
@@ -57,6 +61,8 @@ Call keyboard_shortcuts before using shortcuts: the shortcut key may be \
 Command (super) or Ctrl. For long or multi-line text, or an editor that \
 indents and closes brackets by itself, set_clipboard and paste instead of \
 type_text. \
+When the next steps need no look at the screen in between, run them in one \
+actions call, e.g. click a field, type, press Return and take a screenshot. \
 The first action asks the user for permission. \
 Input pauses while the user uses the pointer or keyboard, and system dialogs \
 (permission and password prompts) are only for the user to answer.";
@@ -282,6 +288,30 @@ fn tools() -> Value {
             }
         }
     ]);
+    let names: Vec<Value> = tools.as_array().into_iter().flatten().map(|tool| tool["name"].clone()).collect();
+    tools.as_array_mut().unwrap().push(json!({
+        "name": "actions",
+        "description": "Runs several of the other tools in order in one call, to save a round trip for each. Use it for steps that need no look at the screen in between, and end with a screenshot to see the result. Stops at the first step that fails and says which one. Only the image of the last screenshot or zoom step is returned.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "steps": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": MAX_ACTION_STEPS,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "tool": { "type": "string", "enum": names },
+                            "arguments": { "type": "object", "description": "The arguments as that tool's own schema names them." }
+                        },
+                        "required": ["tool"]
+                    }
+                }
+            },
+            "required": ["steps"]
+        }
+    }));
     // Agent apps may ask the user before each tool; these only look.
     for tool in tools.as_array_mut().into_iter().flatten() {
         if READ_ONLY_TOOLS.contains(&tool["name"].as_str().unwrap_or_default()) {
@@ -520,6 +550,73 @@ impl Server {
 
     fn handles(&mut self) -> Result<HashSet<u32>, String> {
         Ok(self.desktop()?.windows()?.iter().map(|w| w.handle).collect())
+    }
+
+    // Each step's text, numbered, and the image of the last step that had one:
+    // the agent app refuses a result that is too large.
+    fn actions(&mut self, arguments: &Value) -> Result<Value, String> {
+        let steps = arguments
+            .get("steps")
+            .and_then(Value::as_array)
+            .filter(|steps| !steps.is_empty())
+            .ok_or("\"steps\" must be a list of steps.")?;
+        if steps.len() > MAX_ACTION_STEPS {
+            return Err(format!("Give at most {MAX_ACTION_STEPS} steps."));
+        }
+        // A misspelt tool fails the call before any step runs.
+        let tools = tools();
+        let known = |name: &str| tools.as_array().into_iter().flatten().any(|tool| tool["name"] == name);
+        for (index, step) in steps.iter().enumerate() {
+            let name = step.get("tool").and_then(Value::as_str).unwrap_or_default();
+            if name == "actions" || !known(name) {
+                return Err(format!("Step {}: \"{name}\" is not a tool actions can run.", index + 1));
+            }
+        }
+
+        let no_arguments = json!({});
+        let mut lines = Vec::new();
+        let mut image = None;
+        let mut failed = false;
+        let mut acted = false;
+        for (index, step) in steps.iter().enumerate() {
+            let number = index + 1;
+            let name = step["tool"].as_str().unwrap_or_default();
+            let step_arguments = step.get("arguments").unwrap_or(&no_arguments);
+            if matches!(name, "screenshot" | "zoom") {
+                if acted && step_arguments.get("delay").is_none() {
+                    sleep(ACTION_SETTLE);
+                }
+                acted = false;
+            } else if !READ_ONLY_TOOLS.contains(&name) {
+                acted = true;
+            }
+            match self.call(name, step_arguments) {
+                Ok(result) => {
+                    let mut texts = Vec::new();
+                    for block in result["content"].as_array().into_iter().flatten() {
+                        if block["type"] == "image" {
+                            image = Some(block.clone());
+                        } else if let Some(line) = block["text"].as_str() {
+                            texts.push(line);
+                        }
+                    }
+                    lines.push(format!("{number}. {name}: {}", texts.join(" ")));
+                }
+                Err(error) => {
+                    lines.push(format!("{number}. {name} failed: {error}"));
+                    match steps.len() - number {
+                        0 => {}
+                        1 => lines.push(format!("Step {} did not run.", steps.len())),
+                        _ => lines.push(format!("Steps {} to {} did not run.", number + 1, steps.len())),
+                    }
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        let mut content: Vec<Value> = image.into_iter().collect();
+        content.push(json!({ "type": "text", "text": lines.join("\n") }));
+        Ok(json!({ "content": content, "isError": failed }))
     }
 
     fn call(&mut self, name: &str, arguments: &Value) -> Result<Value, String> {
@@ -809,6 +906,7 @@ impl Server {
                 let window = self.new_window(&before)?;
                 Ok(text(format!("Opened {target}. {window}")))
             }
+            "actions" => self.actions(arguments),
             _ => Err(format!("Unknown tool \"{name}\".")),
         }
     }
@@ -915,6 +1013,29 @@ mod tests {
         assert!(open_target("--help").is_err());
         assert!(open_target("relative/path").is_err());
         assert!(open_target("/nonexistent/file").is_err());
+    }
+
+    #[test]
+    fn actions_check_every_tool_first_and_stop_at_a_failure() {
+        let mut server = Server { desktop: Err("No desktop.".into()), agent_name: String::new() };
+        let run = |server: &mut Server, steps: Value| server.call("actions", &json!({ "steps": steps }));
+        assert!(run(&mut server, json!([])).is_err());
+        assert!(run(&mut server, json!([{ "tool": "actions" }])).is_err());
+        assert!(run(&mut server, json!([{ "tool": "list_windows" }, { "tool": "clik" }]))
+            .unwrap_err()
+            .starts_with("Step 2:"));
+
+        let steps = json!([
+            { "tool": "click", "arguments": { "x": 1, "y": 1 } },
+            { "tool": "type_text", "arguments": { "text": "a" } },
+            { "tool": "screenshot" }
+        ]);
+        let result = run(&mut server, steps).unwrap();
+        assert_eq!(result["isError"], true);
+        assert_eq!(
+            result["content"][0]["text"],
+            "1. click failed: No desktop.\nSteps 2 to 3 did not run."
+        );
     }
 
     #[test]

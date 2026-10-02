@@ -331,6 +331,20 @@ fn failure(message: impl Into<String>) -> Value {
     json!({ "content": [{ "type": "text", "text": message.into() }], "isError": true })
 }
 
+fn captioned_image(data: Vec<u8>, mime_type: &str, caption: String) -> Value {
+    json!({ "content": [
+        {
+            "type": "image",
+            "data": base64::engine::general_purpose::STANDARD.encode(data),
+            "mimeType": mime_type
+        },
+        {
+            "type": "text",
+            "text": caption
+        }
+    ] })
+}
+
 fn number(arguments: &Value, name: &str) -> Result<f64, String> {
     arguments
         .get(name)
@@ -408,7 +422,6 @@ fn segments(text: &str) -> Vec<&str> {
     parts
 }
 
-// A point, when both x and y are given.
 // A memfd holding `bytes`, read from the start.
 fn memory_file(bytes: &[u8]) -> Result<File, String> {
     let failed = |_| "Could not hold the text.".to_string();
@@ -431,8 +444,10 @@ fn window_handle(arguments: &Value) -> Result<u32, String> {
         .ok_or_else(|| "\"window\" must be a number from list_windows.".to_string())
 }
 
+// A point, when both x and y are given.
 fn optional_point(desktop: &mut Desktop, arguments: &Value) -> Result<Option<(f64, f64)>, String> {
     match (arguments.get("x"), arguments.get("y")) {
+        (None | Some(Value::Null), None | Some(Value::Null)) => Ok(None),
         (Some(_), Some(_)) => {
             Ok(Some(desktop.to_logical(number(arguments, "x")?, number(arguments, "y")?)?))
         }
@@ -520,14 +535,11 @@ fn untypable(typed: bool) -> String {
 
 struct Server {
     desktop: Result<Desktop, String>,
-    agent_name: String,
 }
 
 impl Server {
     fn desktop(&mut self) -> Result<&mut Desktop, String> {
-        let desktop = self.desktop.as_mut().map_err(|e| e.clone())?;
-        desktop.agent_name = self.agent_name.clone();
-        Ok(desktop)
+        self.desktop.as_mut().map_err(|e| e.clone())
     }
 
     // Waits for a window that is not among `before`, and says what came up.
@@ -587,7 +599,7 @@ impl Server {
             // An application shows input a moment after it arrives, which the
             // agent's own round trip covers between single calls.
             if matches!(name, "screenshot" | "zoom") {
-                if acted && step_arguments.get("delay").is_none() {
+                if acted && step_arguments.get("delay").is_none_or(Value::is_null) {
                     self.desktop()?.settle(SETTLE_TIMEOUT)?;
                 }
                 acted = false;
@@ -658,17 +670,7 @@ impl Server {
                     ),
                     None => format!("The desktop at {}x{} pixels.", layout.width, layout.height),
                 };
-                Ok(json!({ "content": [
-                    {
-                        "type": "image",
-                        "data": base64::engine::general_purpose::STANDARD.encode(data),
-                        "mimeType": mime_type
-                    },
-                    {
-                        "type": "text",
-                        "text": caption
-                    }
-                ] }))
+                Ok(captioned_image(data, mime_type, caption))
             }
             "zoom" => {
                 let (x, y) = (number(arguments, "x")?, number(arguments, "y")?);
@@ -677,23 +679,14 @@ impl Server {
                     return Err("\"width\" and \"height\" must be at least 1.".into());
                 }
                 let (data, mime_type, layout) = self.desktop()?.zoom(x, y, width, height)?;
-                Ok(json!({ "content": [
-                    {
-                        "type": "image",
-                        "data": base64::engine::general_purpose::STANDARD.encode(data),
-                        "mimeType": mime_type
-                    },
-                    {
-                        "type": "text",
-                        "text": format!(
-                            "Screenshot pixels {x},{y} to {},{} at {}x{} pixels. Coordinates still refer to the screenshot.",
-                            x + width,
-                            y + height,
-                            layout.width,
-                            layout.height
-                        )
-                    }
-                ] }))
+                let caption = format!(
+                    "Screenshot pixels {x},{y} to {},{} at {}x{} pixels. Coordinates still refer to the screenshot.",
+                    x + width,
+                    y + height,
+                    layout.width,
+                    layout.height
+                );
+                Ok(captioned_image(data, mime_type, caption))
             }
             "click" => {
                 let (x, y) = (number(arguments, "x")?, number(arguments, "y")?);
@@ -787,10 +780,7 @@ impl Server {
                 Ok(text("Scrolled."))
             }
             "type_text" => {
-                let text_argument = arguments
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .ok_or("\"text\" must be a string.")?;
+                let text_argument = string(arguments, "text")?;
                 let desktop = self.desktop()?;
                 // Each piece on its own, so a paused piece is not typed twice.
                 // The pause between pieces lets the application take the keys
@@ -824,10 +814,7 @@ impl Server {
                 Ok(text("Typed."))
             }
             "press_keys" => {
-                let chord = arguments
-                    .get("keys")
-                    .and_then(Value::as_str)
-                    .ok_or("\"keys\" must be a string.")?;
+                let chord = string(arguments, "keys")?;
                 let keys = keys::parse_chord(chord)?;
                 let repeat = optional_integer(arguments, "repeat", 1)?.clamp(1, 50);
                 let desktop = self.desktop()?;
@@ -952,7 +939,9 @@ impl Server {
             "initialize" => {
                 let client = &params["clientInfo"];
                 if let Some(name) = client["title"].as_str().or(client["name"].as_str()) {
-                    self.agent_name = name.to_string();
+                    if let Ok(desktop) = &mut self.desktop {
+                        desktop.agent_name = name.to_string();
+                    }
                 }
                 let requested = params["protocolVersion"].as_str().unwrap_or_default();
                 let version = PROTOCOL_VERSIONS
@@ -997,7 +986,7 @@ fn main() {
     if let Err(error) = &desktop {
         eprintln!("cutefish-computer-use: {error}");
     }
-    let mut server = Server { desktop, agent_name: String::new() };
+    let mut server = Server { desktop };
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -1049,7 +1038,7 @@ mod tests {
 
     #[test]
     fn actions_check_every_tool_first_and_stop_at_a_failure() {
-        let mut server = Server { desktop: Err("No desktop.".into()), agent_name: String::new() };
+        let mut server = Server { desktop: Err("No desktop.".into()) };
         let run = |server: &mut Server, steps: Value| server.call("actions", &json!({ "steps": steps }));
         assert!(run(&mut server, json!([])).is_err());
         assert!(run(&mut server, json!([{ "tool": "actions" }])).is_err());

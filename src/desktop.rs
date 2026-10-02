@@ -7,6 +7,7 @@ use std::os::unix::net::UnixStream;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
+use wayland_client::backend::{ReadEventsGuard, WaylandError};
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
 use wayland_client::protocol::{wl_buffer, wl_callback, wl_output, wl_registry, wl_shm, wl_shm_pool};
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum};
@@ -135,6 +136,15 @@ fn revoke_message(reason: Option<RevokeReason>) -> String {
 
 fn protocol_error(error: impl std::fmt::Display) -> String {
     format!("Lost the connection to the compositor: {error}")
+}
+
+// Reads what the socket holds; finding nothing there is no error.
+fn read_events(guard: ReadEventsGuard) -> Result<()> {
+    match guard.read() {
+        Ok(_) => Ok(()),
+        Err(WaylandError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+        Err(e) => Err(protocol_error(e)),
+    }
 }
 
 fn connect_to_display() -> Result<Connection> {
@@ -304,18 +314,17 @@ impl Desktop {
             // SAFETY: one valid pollfd for the duration of the call.
             let ready = unsafe { libc::poll(&mut poll, 1, timeout) };
             if ready > 0 {
-                match guard.read() {
-                    Ok(_) => {}
-                    Err(wayland_client::backend::WaylandError::Io(e))
-                        if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(e) => return Err(protocol_error(e)),
-                }
+                read_events(guard)?;
             }
         }
     }
 
     // Takes in whatever the compositor sent meanwhile, such as a revocation.
     fn pump(&mut self) -> Result<()> {
+        // dispatch_until reads the socket only while it waits; this waits for nothing.
+        if let Some(guard) = self.queue.prepare_read() {
+            read_events(guard)?;
+        }
         self.dispatch_until(Instant::now(), |_| false).map(|_| ())
     }
 
@@ -324,6 +333,13 @@ impl Desktop {
             control.destroy();
         }
         let _ = self.connection.flush();
+    }
+
+    // Tells the agent once why its control ended; the next call asks again.
+    fn revoked(&mut self, reason: Option<RevokeReason>) -> String {
+        self.state.grant = Grant::Revoked(reason, true);
+        self.drop_control();
+        revoke_message(reason)
     }
 
     // A granted control, asking the user for one if need be. A control the
@@ -336,11 +352,7 @@ impl Desktop {
                     return Ok(control.clone());
                 }
             }
-            Grant::Revoked(reason, false) => {
-                self.state.grant = Grant::Revoked(reason, true);
-                self.drop_control();
-                return Err(revoke_message(reason));
-            }
+            Grant::Revoked(reason, false) => return Err(self.revoked(reason)),
             _ => {}
         }
         self.drop_control();
@@ -355,11 +367,7 @@ impl Desktop {
                 sleep(PROMPT_CLOSE);
                 Ok(control)
             }
-            Grant::Revoked(reason, _) => {
-                self.state.grant = Grant::Revoked(reason, true);
-                self.drop_control();
-                Err(revoke_message(reason))
-            }
+            Grant::Revoked(reason, _) => Err(self.revoked(reason)),
             _ => {
                 // Destroying the control withdraws the prompt.
                 self.drop_control();
@@ -379,20 +387,28 @@ impl Desktop {
         }
     }
 
+    // Sends requests on a granted control and waits for the compositor to
+    // handle them; the rejections they met.
+    fn exchange(&mut self, send: impl Fn(&Control, &Connection)) -> Result<Vec<Rejection>> {
+        let control = self.ensure_control()?;
+        self.state.rejections.clear();
+        send(&control, &self.connection);
+        self.queue.roundtrip(&mut self.state).map_err(protocol_error)?;
+        if let Grant::Revoked(reason, false) = self.state.grant {
+            return Err(self.revoked(reason));
+        }
+        Ok(std::mem::take(&mut self.state.rejections))
+    }
+
     // As inject, but an untypable batch is Ok(false) rather than an error.
     pub fn try_inject(&mut self, batch: &dyn Fn(&mut Batch)) -> Result<bool> {
+        // The retry window starts once the control is granted; the consent
+        // prompt can take minutes.
+        self.ensure_control()?;
         let deadline = Instant::now() + PAUSE_TIMEOUT;
         loop {
-            let control = self.ensure_control()?;
-            self.state.rejections.clear();
-            batch(&mut Batch { control: &control, connection: &self.connection });
-            self.queue.roundtrip(&mut self.state).map_err(protocol_error)?;
-            if let Grant::Revoked(reason, false) = self.state.grant {
-                self.state.grant = Grant::Revoked(reason, true);
-                self.drop_control();
-                return Err(revoke_message(reason));
-            }
-            let rejections = std::mem::take(&mut self.state.rejections);
+            let rejections =
+                self.exchange(|control, connection| batch(&mut Batch { control, connection }))?;
             if rejections.is_empty() {
                 return Ok(true);
             }
@@ -434,16 +450,7 @@ impl Desktop {
 
     // Sends a query and waits for its answer: the control must be granted.
     fn query(&mut self, send: impl Fn(&Control)) -> Result<()> {
-        let control = self.ensure_control()?;
-        self.state.rejections.clear();
-        send(&control);
-        self.queue.roundtrip(&mut self.state).map_err(protocol_error)?;
-        if let Grant::Revoked(reason, false) = self.state.grant {
-            self.state.grant = Grant::Revoked(reason, true);
-            self.drop_control();
-            return Err(revoke_message(reason));
-        }
-        if !std::mem::take(&mut self.state.rejections).is_empty() {
+        if !self.exchange(|control, _| send(control))?.is_empty() {
             return Err("The compositor did not answer.".into());
         }
         Ok(())

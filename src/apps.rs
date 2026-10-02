@@ -103,8 +103,10 @@ fn parse(
         .unwrap_or_default()
         .trim_matches('"')
         .to_string();
-    let shown = !yes("Hidden")
-        && !yes("NoDisplay")
+    let hidden = yes("Hidden");
+    let no_display = yes("NoDisplay");
+    let shown = !hidden
+        && !no_display
         && !name.is_empty()
         && (get("Exec").is_some_and(|exec| !exec.is_empty()) || yes("DBusActivatable"))
         && get("TryExec").is_none_or(|program| program.is_empty() || executable_exists(program))
@@ -118,8 +120,8 @@ fn parse(
         program,
         icon: get("Icon").unwrap_or_default().to_string(),
         file_name: file_name.to_string(),
-        hidden: yes("Hidden"),
-        no_display: yes("NoDisplay"),
+        hidden,
+        no_display,
         shown,
     })
 }
@@ -203,7 +205,7 @@ fn starts_with_word(value: &str, prefix: &str) -> bool {
 // The entry of a window's app_id, scored as the dock scores a Wayland window
 // (cutefish-framework `ApplicationRegistry::resolveWindow` with only the
 // app_id, which stands in for the window class too).
-pub fn for_window(apps: &[App], app_id: &str) -> Option<App> {
+pub fn for_window<'a>(apps: &'a [App], app_id: &str) -> Option<&'a App> {
     let wanted = app_id.trim().to_lowercase();
     if wanted.is_empty() {
         return None;
@@ -234,7 +236,7 @@ pub fn for_window(apps: &[App], app_id: &str) -> Option<App> {
             _ => best = Some((app, score, preference)),
         }
     }
-    best.map(|(app, _, _)| app.clone())
+    best.map(|(app, _, _)| app)
 }
 
 // The application `query` names: its id, its name, or else the one name or id
@@ -341,7 +343,7 @@ mod tests {
             entry("code", "Name=Visual Studio Code\nExec=/usr/share/code/code\nStartupWMClass=Code"),
             entry("codeblocks", "Name=Code::Blocks IDE\nExec=codeblocks"),
         ];
-        let id = |app_id: &str| for_window(&apps, app_id).map(|app| app.id);
+        let id = |app_id: &str| for_window(&apps, app_id).map(|app| app.id.clone());
         assert_eq!(id("gedit").as_deref(), Some("org.gnome.gedit"));
         assert_eq!(id("Firefox-ESR").as_deref(), Some("firefox-esr"));
         assert_eq!(id("code").as_deref(), Some("code"));

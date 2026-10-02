@@ -52,11 +52,15 @@ const NAMED_CODES: &[(&[&str], u32)] = &[
     (&["xf86audiomute"], 113),
     (&["xf86audiolowervolume"], 114),
     (&["xf86audioraisevolume"], 115),
+    (&["xf86launcha"], 120),
     (&["xf86audionext"], 163),
     (&["xf86audioplay", "xf86audiopause"], 164),
     (&["xf86audioprev"], 165),
     (&["xf86monbrightnessdown"], 224),
     (&["xf86monbrightnessup"], 225),
+    (&["xf86kbdbrightnessdown"], 229),
+    (&["xf86kbdbrightnessup"], 230),
+    (&["xf86audiomicmute"], 248),
 ];
 
 const NAMED_SYMS: &[(&str, char)] = &[

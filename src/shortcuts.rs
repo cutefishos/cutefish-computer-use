@@ -1,5 +1,5 @@
 // The session's keyboard shortcuts, from the compositor's
-// com.cutefish.Shortcuts1, written as the chords press_keys takes.
+// org.cutefish.Shortcuts1, written as the chords press_keys takes.
 
 use serde_json::Value;
 

@@ -42,14 +42,14 @@ pub fn variable(name: &str) -> Option<String> {
     env::var(name).ok().filter(|value| !value.is_empty()).or_else(|| exported(name))
 }
 
-// Calls com.cutefish.AppRuntime, which starts applications with the session's
+// Calls org.cutefish.AppRuntime, which starts applications with the session's
 // environment, and returns the pid it reports.
 fn call_app_runtime(method: &str, signature: &str, arguments: &[&str]) -> Result<u32, String> {
     let failed = || "The session could not start it.".to_string();
     // "--" keeps an argument that starts with a dash from reading as an option.
     let output = Command::new("busctl")
-        .args(["--user", "--", "call", "com.cutefish.AppRuntime", "/AppRuntime"])
-        .args(["com.cutefish.AppRuntime", method, signature])
+        .args(["--user", "--", "call", "org.cutefish.AppRuntime", "/AppRuntime"])
+        .args(["org.cutefish.AppRuntime", method, signature])
         .args(arguments)
         .env("XDG_RUNTIME_DIR", runtime_dir())
         .output()
@@ -91,7 +91,7 @@ fn busctl(arguments: &[&str]) -> Option<Value> {
 }
 
 const SHORTCUTS: [&str; 3] =
-    ["com.cutefish.Shortcuts1", "/com/cutefish/Shortcuts1", "com.cutefish.Shortcuts1"];
+    ["org.cutefish.Shortcuts1", "/org/cutefish/Shortcuts1", "org.cutefish.Shortcuts1"];
 
 // "command" or "pc".
 pub fn shortcut_convention() -> Option<String> {

@@ -1,4 +1,7 @@
-// Key names as agents write them, after xdotool's: "ctrl+shift+t", "Return".
+// SPDX-FileCopyrightText: 2026 Reion Wong <reionwong@gmail.com>
+// SPDX-License-Identifier: BSD-3-Clause
+
+// Key names as agents write them: "ctrl+shift+t", "Return".
 
 // Linux evdev codes, from linux/input-event-codes.h.
 pub const KEY_LEFTCTRL: u32 = 29;
@@ -102,7 +105,7 @@ fn keysym(character: char) -> u32 {
 fn token(name: &str) -> Result<Vec<Key>, String> {
     let mut characters = name.chars();
     if let (Some(character), None) = (characters.next(), characters.next()) {
-        // As xdotool: a capital letter is the letter with Shift.
+        // A capital letter is the letter with Shift.
         if character.is_uppercase() {
             let lower: Vec<char> = character.to_lowercase().collect();
             if lower.len() == 1 {

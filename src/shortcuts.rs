@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Reion Wong <reionwong@gmail.com>
+// SPDX-License-Identifier: BSD-3-Clause
+
 // The session's keyboard shortcuts, from the compositor's
 // org.cutefish.Shortcuts1, written as the chords press_keys takes.
 

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Reion Wong <reionwong@gmail.com>
+// SPDX-License-Identifier: BSD-3-Clause
+
 // The compositor side: outputs, the control and screen capture.
 
 use std::env;

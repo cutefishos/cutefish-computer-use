@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Reion Wong <reionwong@gmail.com>
+// SPDX-License-Identifier: BSD-3-Clause
+
 // Installed applications, from their desktop entries, filtered as the
 // Cutefish application registry filters them.
 
@@ -284,12 +287,12 @@ mod tests {
 
     #[test]
     fn entries_are_filtered_as_the_launcher_filters_them() {
-        let locales = vec!["zh_CN".to_string(), "zh".to_string()];
-        let text = "[Desktop Entry]\nType=Application\nName=Text Editor\nName[zh]=文本编辑器\nExec=gedit %U\n\
+        let locales = vec!["de_DE".to_string(), "de".to_string()];
+        let text = "[Desktop Entry]\nType=Application\nName=Text Editor\nName[de]=Texteditor\nExec=gedit %U\n\
                     StartupWMClass=Gedit\n[Desktop Action new]\nName=New\n";
         let app = parse("org.gnome.gedit", "org.gnome.gedit", text, &locales, &desktops()).unwrap();
         assert!(app.shown);
-        assert_eq!(app.display_name(), "文本编辑器");
+        assert_eq!(app.display_name(), "Texteditor");
         assert_eq!(app.wm_class.as_deref(), Some("Gedit"));
 
         let hidden = |extra: &str| {
@@ -315,14 +318,14 @@ mod tests {
             ..App::default()
         };
         let apps = vec![
-            app("org.gnome.gedit", "Text Editor", Some("文本编辑器")),
+            app("org.gnome.gedit", "Text Editor", Some("Texteditor")),
             app("firefox-esr", "Firefox ESR", None),
-            app("cutefish-terminal", "Terminal", Some("终端")),
+            app("cutefish-terminal", "Terminal", Some("Konsole")),
             app("xterm", "XTerm", None),
         ];
         assert_eq!(find(&apps, "org.gnome.gedit.desktop").unwrap().id, "org.gnome.gedit");
         assert_eq!(find(&apps, "text editor").unwrap().id, "org.gnome.gedit");
-        assert_eq!(find(&apps, "终端").unwrap().id, "cutefish-terminal");
+        assert_eq!(find(&apps, "konsole").unwrap().id, "cutefish-terminal");
         assert_eq!(find(&apps, "firefox").unwrap().id, "firefox-esr");
         assert_eq!(find(&apps, "xterm").unwrap().id, "xterm");
         assert!(find(&apps, "term").unwrap_err().contains("Several"));

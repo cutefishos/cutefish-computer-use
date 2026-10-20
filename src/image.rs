@@ -1,11 +1,14 @@
+// SPDX-FileCopyrightText: 2026 Reion Wong <reionwong@gmail.com>
+// SPDX-License-Identifier: BSD-3-Clause
+
 // The desktop, or a part of it, as one image: every output scaled into the
 // logical layout, then down to a size a model reads whole.
 
-// Anthropic's guidance for screenshots: the long edge and the pixel count a
-// model sees without scaling the image itself.
+// The long edge and the pixel count a model sees without scaling the image
+// itself.
 const MAX_EDGE: f64 = 1568.0;
 const MAX_PIXELS: f64 = 1_150_000.0;
-// Claude Desktop refuses a tool result over 1 MB, and base64 adds a third.
+// Agent apps refuse a tool result over 1 MB, and base64 adds a third.
 const MAX_BYTES: usize = 700_000;
 const JPEG_QUALITIES: [u8; 4] = [85, 70, 55, 40];
 

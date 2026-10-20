@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Reion Wong <reionwong@gmail.com>
+// SPDX-License-Identifier: BSD-3-Clause
+
 // The user's session: its environment, its application runtime and its
 // keyboard shortcuts.
 
@@ -16,8 +19,8 @@ pub fn runtime_dir() -> PathBuf {
     })
 }
 
-// Some agent apps start MCP servers with a trimmed environment (Claude Desktop
-// passes no Wayland variables); the session exports its own to systemd.
+// Some agent apps start MCP servers with a trimmed environment, without the
+// Wayland variables; the session exports its own to systemd.
 pub fn exported(name: &str) -> Option<String> {
     static EXPORTED: OnceLock<Vec<(String, String)>> = OnceLock::new();
     let exported = EXPORTED.get_or_init(|| {

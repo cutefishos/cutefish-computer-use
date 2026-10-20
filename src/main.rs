@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Reion Wong <reionwong@gmail.com>
+// SPDX-License-Identifier: BSD-3-Clause
+
 // An MCP server over stdio that lets an agent see the Cutefish desktop and use
 // its pointer and keyboard, once the user allows it.
 
@@ -1062,7 +1065,7 @@ mod tests {
     #[test]
     fn text_is_segmented_at_keys() {
         assert_eq!(segments("abc"), ["abc"]);
-        assert_eq!(segments("你好\r\n\tä\u{8}"), ["你好", "\r\n\t", "ä", "\u{8}"]);
+        assert_eq!(segments("grüße\r\n\tä\u{8}"), ["grüße", "\r\n\t", "ä", "\u{8}"]);
         assert_eq!(segments("\nx"), ["\n", "x"]);
         assert!(segments("").is_empty());
     }

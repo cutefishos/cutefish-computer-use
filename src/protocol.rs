@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Reion Wong <reionwong@gmail.com>
+// SPDX-License-Identifier: BSD-3-Clause
+
 // The compositor's cutefish_computer_control_v1, kept in sync with
 // cutefish-compositor/protocols by copy.
 

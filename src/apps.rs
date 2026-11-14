@@ -72,7 +72,7 @@ fn listed_in(list: &str, desktops: &[String]) -> bool {
 }
 
 // The entry, or nothing when it is not an application. `shown` is false for
-// one the launcher leaves out; Hidden entries come back too, as they mask a
+// one the launchpad leaves out; Hidden entries come back too, as they mask a
 // system entry of the same id.
 fn parse(
     id: &str,
@@ -185,14 +185,14 @@ fn entries() -> Vec<App> {
     apps
 }
 
-// What the launcher shows, by name.
+// What the launchpad shows, by name.
 pub fn installed() -> Vec<App> {
     let mut apps: Vec<App> = entries().into_iter().filter(|app| app.shown).collect();
     apps.sort_by_key(|app| app.display_name().to_lowercase());
     apps
 }
 
-// Every entry that can own windows, including helpers the launcher leaves out.
+// Every entry that can own windows, including helpers the launchpad leaves out.
 pub fn named() -> Vec<App> {
     entries().into_iter().filter(|app| !app.hidden && !app.name.is_empty()).collect()
 }
@@ -286,7 +286,7 @@ mod tests {
     }
 
     #[test]
-    fn entries_are_filtered_as_the_launcher_filters_them() {
+    fn entries_are_filtered_as_the_launchpad_filters_them() {
         let locales = vec!["de_DE".to_string(), "de".to_string()];
         let text = "[Desktop Entry]\nType=Application\nName=Text Editor\nName[de]=Texteditor\nExec=gedit %U\n\
                     StartupWMClass=Gedit\n[Desktop Action new]\nName=New\n";
